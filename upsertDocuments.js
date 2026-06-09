@@ -1,31 +1,29 @@
-import {openai} from "./config.js"
-import {supabase} from "./config.js"
-// Node built-ins: fs = file system, path = path helpers, fileURLToPath = converts ESM URL to a normal path
+import {openai, supabase} from "./config.js"
+import {EMBEDDING_MODEL_NAME, CHUNK_OVERLAP, CHUNK_SIZE} from "./constants.js"
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {simpleTextSplitter} from "./utils.js"
 
 // --- Configuration ---
-const SOURCE_DOCUMENTS_DIR = 'docs';                   // Folder name where source .txt/.md docs live
-const EMBEDDING_MODEL_NAME = 'text-embedding-3-small'; // OpenAI model that turns text into vectors
-const SUPABASE_TABLE_NAME = 'documents';               // Target table in Supabase
-const CLEAR_SUPABASE_TABLE_CONTENTS = true;            // If true, wipe table before re-inserting
+const SOURCE_DOCUMENTS_DIR = 'docs';
+const SUPABASE_TABLE_NAME = 'documents'; // Table created in Supabase
+const CLEAR_SUPABASE_TABLE_CONTENTS = true;
 
-// In ES modules there is no __dirname by default, so we recreate it from import.meta.url
-const __filename = fileURLToPath(import.meta.url);     // Absolute path to THIS file
-const __dirname = path.dirname(__filename);            // Absolute path to the folder THIS file lives in
+// Get __dirname equivalent in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // --- Ingestion Logic ---
 export async function ingestDocuments() {
-  // Build absolute path to the /docs folder next to this script
   const docsDirPath = path.join(__dirname, SOURCE_DOCUMENTS_DIR);
   console.log(`Ingesting documents from directory: ${docsDirPath}`);
 
-  // Accumulator: every doc we successfully embed gets pushed here, then bulk-inserted at the end
+  // *** NEW: Stores all documents to insert across all files ***
   const allDocumentsToInsert = [];
 
   try {
-    // 1. Bail out early if /docs doesn't exist or isn't a directory
+    // 1. Check if directory exists
     if (
       !fs.existsSync(docsDirPath) ||
       !fs.lstatSync(docsDirPath).isDirectory()
@@ -35,10 +33,9 @@ export async function ingestDocuments() {
       );
     }
 
-    // Read the list of filenames inside /docs (just names, not contents)
+    // *** Read all files from the directory ***
     const files = fs.readdirSync(docsDirPath);
 
-    // Nothing to do if the folder is empty
     if (files.length === 0) {
       console.log(
         `No files found in ${docsDirPath}. Nothing to ingest.`
@@ -47,19 +44,16 @@ export async function ingestDocuments() {
     }
     console.log(`Found ${files.length} files to process.`);
 
-    // Optionally clear the table so we don't pile up duplicates on every run
     if (CLEAR_SUPABASE_TABLE_CONTENTS){
 
       console.log(
         `Clearing existing documents from table '${SUPABASE_TABLE_NAME}'...`
       );
-      // Supabase requires a filter for delete; .neq('id', -1) matches every row (no id equals -1)
       const { error: deleteError } = await supabase
         .from(SUPABASE_TABLE_NAME)
         .delete()
-        .neq('id', -1);
+        .neq('id', -1); // Deletes all rows 
       if (deleteError) {
-        // Warn but keep going — a failed clear isn't fatal for inserting new rows
         console.warn(
           `Warning: Could not clear existing documents: ${deleteError.message}`
         );
@@ -68,38 +62,58 @@ export async function ingestDocuments() {
       }
     }
 
-    // Loop over each file in /docs and turn it into an embedding
+    // *** Process each file ***
+    let totalChunks = 0;
+
     for (const filename of files) {
-      const filePath = path.join(docsDirPath, filename); // Absolute path to this specific file
+      const filePath = path.join(docsDirPath, filename);
       console.log(`Processing file: ${filename}...`);
 
-      // 2. Read the entire file into a string (utf-8 = plain text)
+      // Read File Content
       const fileContent = fs.readFileSync(filePath, 'utf-8');
       console.log(` - Read ${fileContent.length} characters.`);
 
 
-      try {
-          // Ask OpenAI to convert the text into a vector (array of numbers representing meaning)
+      // split the large text into chunks
+      const chunks = simpleTextSplitter(fileContent, CHUNK_SIZE, CHUNK_OVERLAP);
+
+
+      if (chunks.length === 0) {
+        console.log(` - No chunks generated for this file.`);
+        continue; // Skip to next file
+      }
+
+      /**
+       * Embed each chunk 
+       */
+      console.log(`Embedding ${chunks.length} chunks of text`)
+      let fileChunkCount = 0;
+      for (const chunk of chunks) {
+        fileChunkCount++;
+        try {
           const embeddings = await openai.embeddings.create({
             model: EMBEDDING_MODEL_NAME,
-            input: fileContent,
+            input: chunk,
           });
-          // Queue this row for insertion: the raw text, its vector, and where it came from
+          // *** Add metadata with source filename ***
           allDocumentsToInsert.push({
-            content: fileContent,
-            embedding: embeddings.data[0].embedding, // The actual number array OpenAI returned
-            metadata: { source: filename },           // Useful for tracing results back to the file
+            content: chunk,
+            embedding: embeddings.data[0].embedding,
+            metadata: { source: filename }, // Store filename here
           });
-          console.log(`- Embedded content from ${filename}`);
+          console.log(`- Embedded chunk ${fileChunkCount} content from ${filename}`);
         } catch (embedError) {
-          // If one file fails to embed, log it and move on instead of killing the whole run
           console.error(
             `   - Failed to embed content from ${filename}: ${embedError.message}. Skipping chunk.`
           );
         }
+      }
+      
      }
 
-    // If nothing embedded successfully, skip the insert step entirely
+    console.log(`Total chunks generated across all files: ${totalChunks}`);
+
+    
     if (allDocumentsToInsert.length === 0) {
       console.log(
         'No documents were successfully embedded across all files. Aborting upload.'
@@ -107,22 +121,20 @@ export async function ingestDocuments() {
       return;
     }
 
-    // Debug log: how many docs are ready + the full payload pretty-printed
     console.log(
-      `Total documents successfully prepared for insertion: ${allDocumentsToInsert.length}\n\n${JSON.stringify(allDocumentsToInsert, null,2)}`
+      `Total documents successfully prepared for insertion: ${allDocumentsToInsert.length}\n\n`
     );
 
 
-    // 5. Single batched insert into Supabase (faster than inserting row by row)
+    // 5. Store all collected documents in Supabase
     console.log(
       `Uploading ${allDocumentsToInsert.length} documents to Supabase table '${SUPABASE_TABLE_NAME}'...`
     );
     const { error: insertError } = await supabase
       .from(SUPABASE_TABLE_NAME)
-      .insert(allDocumentsToInsert);
+      .insert(allDocumentsToInsert); // Insert all collected documents
 
     if (insertError) {
-      // Real failure here — throw so the outer catch handles it and exits the process
       console.error('Error inserting documents into Supabase:', insertError);
       throw new Error(`Supabase insert failed: ${insertError.message}`);
     } else {
@@ -133,9 +145,9 @@ export async function ingestDocuments() {
 
     console.log('--- Ingestion Complete! ---');
   } catch (error) {
-    // Anything thrown in the try-block lands here: log it and exit with a non-zero code for CI/scripts
     console.error('--- Ingestion Failed! ---');
     console.error('Error during ingestion process:', error);
-    process.exit(1);
+    process.exit(1); // Exit with error code
   }
 }
+

@@ -1,9 +1,9 @@
-import {SIMILARITY_MATCH_COUNT, EMBEDDING_MODEL_NAME} from "./constants.js"
+import {SIMILARITY_MATCH_COUNT, EMBEDDING_MODEL_NAME, MATCH_THRESHOLD} from "./constants.js"
 import {openai, supabase} from "./config.js"
 
 export async function retrieveSimilarDocs(query){
 
-  // Create vector embeddings based on the query
+  // Create a vector embedding based on the query
   const embeddingResponse = await openai.embeddings.create({
     model: EMBEDDING_MODEL_NAME,
     input: query,
@@ -18,6 +18,7 @@ export async function retrieveSimilarDocs(query){
     {
       query_embedding: embedding,
       match_count: SIMILARITY_MATCH_COUNT,
+      match_threshold: MATCH_THRESHOLD
     }
   );
 
